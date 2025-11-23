@@ -1,153 +1,91 @@
+
 from pybit.unified_trading import HTTP
 import time
 import logging
-from collections import deque
-import requests
 import os
 from dotenv import load_dotenv
-import threading
-from flask import Flask, jsonify
+import requests
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# === КЛЮЧИ ИЗ ПЕРЕМЕННЫХ RENDER ===
-session = HTTP(testnet=False,
-               api_key=os.getenv("API_KEY"),
-               api_secret=os.getenv("API_SECRET"))
+# === ТВОИ КЛЮЧИ (уже есть в Render) ===
+session = HTTP(
+    testnet=False,                     # False = реальный счёт
+    api_key=os.getenv("API_KEY"),
+    api_secret=os.getenv("API_SECRET")
+)
+
+SYMBOL = "BTCUSDT"
+QTY_USDT = 100          # Сколько USDT держать в позиции (от 50 до скольки хочешь)
+CHECK_INTERVAL = 300    # Проверять каждые 5 минут (funding каждые 8 ч)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# === ТВОИ НАСТРОЙКИ ===
-symbol = "BTCUSDT"
-trade_qty = 10
-rsi_period = 14
-ma_period = 20
-rsi_overbought = 70
-rsi_oversold = 30
-take_profit_pct = 2.0
-stop_loss_pct = 1.0
-interval = 60
-
-price_data = deque(maxlen=100)
-recent_trades = deque(maxlen=200)
-position_opened = False
-entry_price = 0
-
-app = Flask(__name__)
-
-def send_telegram(message):
+def send_telegram(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-    except:
-        pass
+                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except: pass
 
-# ←←←←←←←←←←← ВСТАВЬ СЮДА ВСЕ СВОИ ФУНКЦИИ ←←←←←←←←←←←
-# calculate_rsi, calculate_ma, calculate_approx_cvd,
-# get_kline_data, get_recent_trades, place_spot_buy,
-# close_spot_position, bot_logic
-# (просто скопируй их из твоего старого кода без изменений)
-
-# (вставляю только чтобы код был полным — у тебя они уже есть)
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains = [max(0, d) for d in deltas[-period:]]
-    losses = [max(0, -d) for d in deltas[-period:]]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period or 0.001
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_ma(prices, period=20):
-    if len(prices) < period: return None
-    return sum(prices[-period:]) / period
-
-def calculate_approx_cvd(trades):
-    if not trades: return 0
-    prices = [float(t[4]) for t in trades]
-    volumes = [float(t[3]) for t in trades]
-    avg_price = sum(prices) / len(prices)
-    cvd = sum(volumes[i] if prices[i] > avg_price else -volumes[i] for i in range(len(trades)))
-    return cvd
-
-def get_kline_data(symbol, interval="1m", limit=100):
-    try: return session.get_kline(category="spot", symbol=symbol, interval=interval, limit=limit)['result']['list']
-    except: return []
-
-def get_recent_trades(symbol, limit=50):
-    try: return session.get_public_trade_history(category="spot", symbol=symbol, limit=limit)['result']['list']
-    except: return []
-
-def place_spot_buy():
+# Получаем текущий funding rate
+def get_funding_rate():
     try:
-        session.place_order(category="spot", symbol=symbol, side="Buy", order_type="Market", qty=str(trade_qty))
-        msg = f"Покупка {symbol} × {trade_qty} USDT"
-        logging.info(msg)
-        send_telegram(msg)
-    except Exception as e: logging.error(f"Buy error: {e}")
+        resp = session.get_tickers(category="linear", symbol=SYMBOL)
+        rate = float(resp["result"]["list"][0]["fundingRate"])
+        return rate
+    except Exception as e:
+        logging.error(f"Ошибка funding: {e}")
+        return 0
 
-def close_spot_position():
+# Позиции
+def get_spot_qty():
     try:
-        session.place_order(category="spot", symbol=symbol, side="Sell", order_type="Market", qty=str(trade_qty))
-        msg = f"Продажа {symbol}"
-        logging.info(msg)
-        send_telegram(msg)
-    except Exception as e: logging.error(f"Sell error: {e}")
+        bal = session.get_wallet_balance(accountType="SPOT", coin="USDT")
+        return float(bal["result"]["balances"][0]["free"])
+    except: return 0
 
-def bot_logic():
-    global position_opened, entry_price
-    klines = get_kline_data(symbol)
-    if not klines: return
-    prices = [float(k[4]) for k in klines]
-    current_price = prices[-1]
-    price_data.extend(prices[-20:])
+def get_futures_position():
+    try:
+        pos = session.get_positions(category="linear", symbol=SYMBOL)
+        for p in pos["result"]["list"]:
+            if p["symbol"] == SYMBOL:
+                return float(p["size"]), p["side"]  # размер и сторона
+        return 0, None
+    except: return 0, None
 
-    if len(price_data) < ma_period: return
+# Открываем/поддерживаем хедж
+def hedge():
+    funding = get_funding_rate()
+    spot_usdt = get_spot_qty()
+    fut_size, fut_side = get_futures_position()
 
-    trades = get_recent_trades(symbol)
-    if trades: recent_trades.extend(trades)
+    target_spot = QTY_USDT
+    target_fut = QTY_USDT / float(session.get_tickers(category="linear", symbol=SYMBOL)["result"]["list"][0]["lastPrice"])
 
-    rsi = calculate_rsi(list(price_data))
-    ma = calculate_ma(list(price_data))
-    cvd = calculate_approx_cvd(list(recent_trades))
+    msg = f"Funding Rate: {funding:+.5%}\nSpot USDT: {spot_usdt:.1f}\nFutures {fut_side}: {fut_size:.5f} BTC"
 
-    if not position_opened and current_price > ma and rsi < rsi_overbought and cvd > 0:
-        place_spot_buy()
-        position_opened = True
-        entry_price = current_price
+    # Если funding положительный → шортим фьючерс, держим спот
+    if funding > 0:
+        if fut_side != "Sell" or abs(fut_size - target_fut) > 0.0005:
+            session.place_order(category="linear", symbol=SYMBOL, side="Sell", order_type="Market", qty=round(target_fut, 5))
+            msg += "\nОткрыт/обновлён SHORT на фьючерсах"
+    # Если funding отрицательный → лонгим фьючерс (редко, но бывает)
+    else:
+        if fut_side != "Buy" or abs(fut_size - target_fut) > 0.0005:
+            session.place_order(category="linear", symbol=SYMBOL, side="Buy", order_type="Market", qty=round(target_fut, 5))
+            msg += "\nОткрыт/обновлён LONG на фьючерсах"
 
-    elif position_opened:
-        if current_price >= entry_price * (1 + take_profit_pct/100):
-            close_spot_position(); position_opened = False; send_telegram(f"Take-Profit {current_price}")
-        elif current_price <= entry_price * (1 - stop_loss_pct/100):
-            close_spot_position(); position_opened = False; send_telegram(f"Stop-Loss {current_price}")
-        elif rsi < rsi_oversold:
-            close_spot_position(); position_opened = False; send_telegram(f"Закрыто по RSI {rsi:.1f}")
+    logging.info(msg)
+    send_telegram(msg)
 
-# ←←←←←←←←←←← КОНЕЦ ТВОИХ ФУНКЦИЙ ←←←←←←←←←←←
-
-# Flask-роуты (чтобы Render не усыплял сервис)
-@app.route('/')
-def home():
-    return jsonify({"status": "bot running", "symbol": symbol})
-
-@app.route('/ping')
-def ping():
-    return "OK", 200
-
-# Фоновая торговая петля
-def run_trading_bot():
-    logging.info("Торговый бот запущен в фоне")
-    send_telegram("Bybit бот запущен на Render (бесплатно)")
-    while True:
-        try:
-            bot_logic()
-        except Exception as e:
-            logging.error(f"Ошибка: {e}")
-            send_telegram(f"Ошибка бота: {e}")
-        time.sleep(interval)
-
-threading.Thread(target=run_trading_bot, daemon=True).start()
+# Главный цикл
+send_telegram("Funding Arbitrage бот запущен!\nСобираю funding каждые 8 часов")
+while True:
+    try:
+        hedge()
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        send_telegram(f"Ошибка арбитража: {e}")
+    time.sleep(CHECK_INTERVAL)

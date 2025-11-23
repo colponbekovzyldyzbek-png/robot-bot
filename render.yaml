@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bybit-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main_bot:app
+    autoDeploy: true

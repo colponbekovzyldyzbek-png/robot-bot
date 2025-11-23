@@ -1,0 +1,5 @@
+pybit
+python-dotenv
+requests
+flask
+gunicorn

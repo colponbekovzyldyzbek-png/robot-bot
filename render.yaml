@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: bybit-bot
+    name: bybit-spot-bot
     env: python
     region: oregon
-    plan: free
+    plan: free                 # ← эта строка даёт бесплатный инстанс
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main_bot:app
+    startCommand: gunicorn main_bot:app --bind 0.0.0.0:$PORT --workers 1 --timeout 0
     autoDeploy: true

@@ -150,7 +150,4 @@ def run_trading_bot():
             send_telegram(f"Ошибка бота: {e}")
         time.sleep(interval)
 
-if __name__ == "__main__":
-    threading.Thread(target=run_trading_bot, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+threading.Thread(target=run_trading_bot, daemon=True).start()
